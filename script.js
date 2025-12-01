@@ -11,7 +11,7 @@
 const CONFIG = {
     // ⚠️ IMPORTANT:
     // Do NOT put your real Airtable PAT here.
-    // Later we’ll load data via a secure Netlify Function.
+    // Airtable is now called securely via a Netlify Function.
     AIRTABLE_PAT: '',
     BASE_ID: 'app7jO2b1qmIFNOU4',
     TABLES: {
@@ -34,34 +34,27 @@ let currentView = 'public'; // 'public', 'employer', or 'private'
 
 /**
  * Fetch data from Airtable
- * NOTE: This currently calls Airtable directly.
- * Once we add a Netlify Function, this will instead call
- * /.netlify/functions/airtable and won’t need CONFIG.AIRTABLE_PAT.
+ * NOW uses Netlify serverless function so the token stays secret.
  */
 async function fetchAirtableData(tableName, filterFormula = '') {
-    const url = `https://api.airtable.com/v0/${CONFIG.BASE_ID}/${encodeURIComponent(tableName)}`;
-    const params = new URLSearchParams();
-    
-    if (filterFormula) {
-        params.append('filterByFormula', filterFormula);
-    }
-    
     try {
-        const response = await fetch(`${url}?${params}`, {
+        const response = await fetch('/.netlify/functions/airtable', {
+            method: 'POST',
             headers: {
-                // This will be updated later to call a secure backend.
-                // For now, the PAT is blank for safety.
-                'Authorization': `Bearer ${CONFIG.AIRTABLE_PAT}`,
                 'Content-Type': 'application/json'
-            }
+            },
+            body: JSON.stringify({
+                tableName,
+                filterFormula
+            })
         });
-        
+
         if (!response.ok) {
-            throw new Error(`Airtable API error: ${response.status}`);
+            throw new Error(`Netlify function error: ${response.status}`);
         }
-        
+
         const data = await response.json();
-        return data.records;
+        return data.records || [];
     } catch (error) {
         console.error(`Error fetching from ${tableName}:`, error);
         return [];
