@@ -1,17 +1,13 @@
 // ============================================
 // CAREERID SKILLS PASSPORT - JAVASCRIPT
-// Connects to Airtable, handles three views
-// NOTE: Airtable Personal Access Token has been removed
-//       Never commit real tokens into this file.
+// Uses Netlify serverless function to talk to Airtable securely
 // ============================================
 
 // ============================================
 // CONFIGURATION
 // ============================================
 const CONFIG = {
-    // ⚠️ IMPORTANT:
-    // Do NOT put your real Airtable PAT here.
-    // Airtable is now called securely via a Netlify Function.
+    // Token now lives ONLY in Netlify environment variables.
     AIRTABLE_PAT: '',
     BASE_ID: 'app7jO2b1qmIFNOU4',
     TABLES: {
@@ -28,25 +24,30 @@ const CONFIG = {
 // Current view state
 let currentView = 'public'; // 'public', 'employer', or 'private'
 
-// ============================================
-// AIRTABLE API FUNCTIONS
-// ============================================
+// Cache for skills lookup (ID -> name)
+let skillsLookup = null;
 
-/**
- * Fetch data from Airtable
- * NOW uses Netlify serverless function so the token stays secret.
- */
+// ============================================
+// HELPER: get person name from a record
+// Works with both "Person" and "People" fields
+// ============================================
+function getPersonNameFromFields(fields) {
+    const raw = fields.Person ?? fields.People ?? null;
+    if (!raw) return null;
+    if (Array.isArray(raw) && raw.length > 0) return raw[0];
+    if (typeof raw === 'string') return raw;
+    return null;
+}
+
+// ============================================
+// AIRTABLE VIA NETLIFY FUNCTION
+// ============================================
 async function fetchAirtableData(tableName, filterFormula = '') {
     try {
         const response = await fetch('/.netlify/functions/airtable', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                tableName,
-                filterFormula
-            })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tableName, filterFormula })
         });
 
         if (!response.ok) {
@@ -61,149 +62,170 @@ async function fetchAirtableData(tableName, filterFormula = '') {
     }
 }
 
-/**
- * Get person data
- */
+// ============================================
+// DATA LOADERS
+// ============================================
+
+// Get main People record for Stephanie
 async function getPersonData() {
-    const filter = `{Full Name} = "${CONFIG.PERSON_NAME}"`;
-    const records = await fetchAirtableData(CONFIG.TABLES.people, filter);
-    return records.length > 0 ? records[0].fields : null;
+    const records = await fetchAirtableData(CONFIG.TABLES.people);
+
+    const match = records.find(rec => {
+        const f = rec.fields;
+        return (
+            f['Full Name'] === CONFIG.PERSON_NAME ||
+            f.Name === CONFIG.PERSON_NAME
+        );
+    });
+
+    return match ? match.fields : null;
 }
 
-/**
- * Get skills with visibility filtering
- */
+// Get skills with visibility filtering and Skill name lookup
 async function getSkills(view = 'public') {
-    // First get all person-skills records
-    const filter = `{Person} = "${CONFIG.PERSON_NAME}"`;
-    const personSkills = await fetchAirtableData(CONFIG.TABLES.personSkills, filter);
-    
-    // Filter by visibility based on view
-    const filteredSkills = personSkills.filter(record => {
-        const visibility = record.fields.Visibility;
-        
-        if (view === 'private') {
-            return true; // Show all
-        } else if (view === 'employer') {
-            return visibility === 'Employer' || visibility === 'Public';
-        } else { // public
-            return visibility === 'Public';
-        }
-    });
-    
-    return filteredSkills;
+    const personSkills = await fetchAirtableData(CONFIG.TABLES.personSkills);
+
+    // Build Skills lookup once (record ID -> Name)
+    if (!skillsLookup) {
+        const allSkills = await fetchAirtableData(CONFIG.TABLES.skills);
+        skillsLookup = {};
+        allSkills.forEach(rec => {
+            const f = rec.fields;
+            const displayName =
+                f['Skill Name'] || // if you add later
+                f.Name ||          // current field
+                rec.id;
+            skillsLookup[rec.id] = displayName;
+        });
+    }
+
+    const filtered = personSkills
+        // Only this person
+        .filter(rec => getPersonNameFromFields(rec.fields) === CONFIG.PERSON_NAME)
+        // Visibility
+        .filter(rec => {
+            const vis = rec.fields.Visibility || 'Public';
+            if (view === 'private') return true;
+            if (view === 'employer') return vis === 'Employer' || vis === 'Public';
+            return vis === 'Public';
+        })
+        // Attach human-readable skill name
+        .map(rec => {
+            const fields = rec.fields;
+            let displayName = 'Unnamed Skill';
+
+            if (Array.isArray(fields.Skill) && fields.Skill.length > 0) {
+                const linkedId = fields.Skill[0];
+                displayName = skillsLookup[linkedId] || linkedId;
+            } else if (typeof fields.Skill === 'string') {
+                displayName = fields.Skill;
+            }
+
+            return { ...rec, _skillName: displayName };
+        });
+
+    return filtered;
 }
 
-/**
- * Get experiences with visibility filtering
- */
+// Experiences
 async function getExperiences(view = 'public') {
-    const filter = `{Person} = "${CONFIG.PERSON_NAME}"`;
-    const experiences = await fetchAirtableData(CONFIG.TABLES.experiences, filter);
-    
-    // Filter by visibility if the field exists
-    return experiences.filter(record => {
-        const visibility = record.fields.Visibility;
-        if (!visibility) return true; // If no visibility field, show all
-        
-        if (view === 'private') {
-            return true;
-        } else if (view === 'employer') {
-            return visibility === 'Employer' || visibility === 'Public';
-        } else {
-            return visibility === 'Public';
-        }
-    });
+    const records = await fetchAirtableData(CONFIG.TABLES.experiences);
+
+    return records
+        .filter(rec => getPersonNameFromFields(rec.fields) === CONFIG.PERSON_NAME)
+        .filter(rec => {
+            const vis = rec.fields.Visibility;
+            if (!vis) return true;
+            if (view === 'private') return true;
+            if (view === 'employer') return vis === 'Employer' || vis === 'Public';
+            return vis === 'Public';
+        });
 }
 
-/**
- * Get projects/achievements with visibility filtering
- */
+// Projects / Achievements
 async function getProjects(view = 'public') {
-    const filter = `{Person} = "${CONFIG.PERSON_NAME}"`;
-    const projects = await fetchAirtableData(CONFIG.TABLES.achievements, filter);
-    
-    return projects.filter(record => {
-        const visibility = record.fields.Visibility;
-        if (!visibility) return true;
-        
-        if (view === 'private') {
-            return true;
-        } else if (view === 'employer') {
-            return visibility === 'Employer' || visibility === 'Public';
-        } else {
-            return visibility === 'Public';
-        }
-    });
+    const records = await fetchAirtableData(CONFIG.TABLES.achievements);
+
+    return records
+        .filter(rec => getPersonNameFromFields(rec.fields) === CONFIG.PERSON_NAME)
+        .filter(rec => {
+            const vis = rec.fields.Visibility;
+            if (!vis) return true;
+            if (view === 'private') return true;
+            if (view === 'employer') return vis === 'Employer' || vis === 'Public';
+            return vis === 'Public';
+        });
 }
 
-/**
- * Get training history
- */
+// Training & Learning
 async function getTraining() {
-    const filter = `{Person} = "${CONFIG.PERSON_NAME}"`;
-    return await fetchAirtableData(CONFIG.TABLES.training, filter);
+    const records = await fetchAirtableData(CONFIG.TABLES.training);
+    return records.filter(rec => getPersonNameFromFields(rec.fields) === CONFIG.PERSON_NAME);
 }
 
 // ============================================
 // RENDERING FUNCTIONS
 // ============================================
 
-/**
- * Render About section based on view
- */
 function renderAbout(personData) {
     if (!personData) return;
-    
-    // Public about
+
     const publicAbout = document.getElementById('aboutPublic');
-    if (publicAbout && personData['About (Public)']) {
-        publicAbout.textContent = personData['About (Public)'];
-    } else if (publicAbout) {
-        publicAbout.textContent = 'Add your public profile in Airtable → People → About (Public)';
-    }
-    
-    // Employer about
     const employerAbout = document.getElementById('aboutEmployer');
-    if (employerAbout && personData['About (Employer)']) {
-        employerAbout.textContent = personData['About (Employer)'];
-    } else if (employerAbout) {
-        employerAbout.textContent = 'Add employer information in Airtable → People → About (Employer)';
-    }
-    
-    // Private about
     const privateAbout = document.getElementById('aboutPrivate');
-    if (privateAbout && personData['About (Private)']) {
-        privateAbout.textContent = personData['About (Private)'];
-    } else if (privateAbout) {
-        privateAbout.textContent = 'Add private notes in Airtable → People → About (Private)';
+
+    const aboutPublic =
+        personData['About (Public)'] ||
+        personData['About - Public'] ||
+        '';
+
+    const aboutEmployer =
+        personData['About - Employer'] ||
+        personData['About (Professional)'] ||
+        '';
+
+    const aboutPrivate =
+        personData['About (Private)'] ||
+        personData['About - Private'] ||
+        '';
+
+    if (publicAbout) {
+        publicAbout.textContent =
+            aboutPublic || 'Add your public profile in Airtable → People → About (Public)';
+    }
+
+    if (employerAbout) {
+        employerAbout.textContent =
+            aboutEmployer || 'Add employer content in Airtable → People → About - Employer';
+    }
+
+    if (privateAbout) {
+        privateAbout.textContent =
+            aboutPrivate || 'Add private notes in Airtable → People → About (Private)';
     }
 }
 
-/**
- * Render skills
- */
 function renderSkills(skills) {
     const container = document.getElementById('skillsContainer');
     if (!container) return;
-    
+
     if (skills.length === 0) {
         container.innerHTML = '<p class="loading">No skills to display for this view.</p>';
         return;
     }
-    
+
     container.innerHTML = skills.map(record => {
         const fields = record.fields;
-        const skillName = Array.isArray(fields.Skill) ? fields.Skill[0] : fields.Skill || 'Unnamed Skill';
+        const skillName = record._skillName ||
+            (Array.isArray(fields.Skill) ? fields.Skill[0] : fields.Skill || 'Unnamed Skill');
         const proficiency = fields.Proficiency || 'Not specified';
         const status = fields.Status || 'Current';
         const visibility = fields.Visibility || 'Public';
-        
-        // Get proficiency class
+
         const proficiencyClass = proficiency.toLowerCase().replace(/\s+/g, '-');
         const statusClass = status.toLowerCase().replace(/\s+/g, '-');
         const visibilityClass = visibility.toLowerCase();
-        
+
         return `
             <div class="skill-card" role="listitem">
                 <div class="skill-header">
@@ -219,25 +241,29 @@ function renderSkills(skills) {
     }).join('');
 }
 
-/**
- * Render experiences
- */
 function renderExperiences(experiences) {
     const container = document.getElementById('experienceContainer');
     if (!container) return;
-    
+
     if (experiences.length === 0) {
         container.innerHTML = '<p class="loading">Add experiences in Airtable → Experiences table</p>';
         return;
     }
-    
+
     container.innerHTML = experiences.map(record => {
         const fields = record.fields;
-        const role = fields.Role || 'Role';
-        const company = fields.Organization || 'Company';
-        const dates = fields['Date Range'] || 'Dates';
+        const role = fields.Name || 'Role';
+        const company = fields.Company || 'Company';
+
+        let dates = '';
+        if (fields['Start Date'] || fields['End Date']) {
+            const start = fields['Start Date'] || '';
+            const end = fields['End Date'] || 'Present';
+            dates = `${start} – ${end}`;
+        }
+
         const description = fields.Description || '';
-        
+
         return `
             <article class="experience-item">
                 <div class="experience-header">
@@ -253,23 +279,20 @@ function renderExperiences(experiences) {
     }).join('');
 }
 
-/**
- * Render projects
- */
 function renderProjects(projects) {
     const container = document.getElementById('projectsContainer');
     if (!container) return;
-    
+
     if (projects.length === 0) {
         container.innerHTML = '<p class="loading">Add projects in Airtable → Achievements table</p>';
         return;
     }
-    
+
     container.innerHTML = projects.map(record => {
         const fields = record.fields;
         const name = fields.Name || 'Project';
-        const description = fields.Description || '';
-        
+        const description = fields.Notes || fields.Status || '';
+
         return `
             <article class="project-card">
                 <h3 class="project-title">${name}</h3>
@@ -279,24 +302,21 @@ function renderProjects(projects) {
     }).join('');
 }
 
-/**
- * Render training
- */
 function renderTraining(training) {
     const container = document.getElementById('trainingContainer');
     if (!container) return;
-    
+
     if (training.length === 0) {
         container.innerHTML = '<p class="loading">Add training in Airtable → Training & Learning table</p>';
         return;
     }
-    
+
     container.innerHTML = training.map(record => {
         const fields = record.fields;
-        const name = fields['Course/Training Name'] || 'Training';
-        const provider = fields.Provider || '';
-        const date = fields['Completion Date'] || '';
-        
+        const name = fields.Name || 'Training';
+        const provider = fields.Notes || '';
+        const date = fields['Completion date'] || '';
+
         return `
             <div class="training-item">
                 <p class="training-name">${name}</p>
@@ -310,29 +330,22 @@ function renderTraining(training) {
 // ============================================
 // VIEW SWITCHING
 // ============================================
-
-/**
- * Update visibility of content sections based on view
- */
 function updateViewVisibility(view) {
-    // Update employer content visibility
     const employerContent = document.querySelectorAll('.employer-content');
     employerContent.forEach(el => {
         el.style.display = (view === 'employer' || view === 'private') ? 'block' : 'none';
     });
-    
-    // Update private content visibility
+
     const privateContent = document.querySelectorAll('.private-content');
     privateContent.forEach(el => {
         el.style.display = (view === 'private') ? 'block' : 'none';
     });
-    
-    // Update button states
+
     document.querySelectorAll('.view-btn').forEach(btn => {
         btn.classList.remove('active');
         btn.setAttribute('aria-pressed', 'false');
     });
-    
+
     const activeBtn = document.getElementById(`${view}View`);
     if (activeBtn) {
         activeBtn.classList.add('active');
@@ -340,63 +353,45 @@ function updateViewVisibility(view) {
     }
 }
 
-/**
- * Load all data for a specific view
- */
 async function loadView(view) {
     currentView = view;
     updateViewVisibility(view);
-    
+
     try {
-        // Load person data
         const personData = await getPersonData();
         renderAbout(personData);
-        
-        // Load skills for this view
+
         const skills = await getSkills(view);
         renderSkills(skills);
-        
-        // Load experiences for this view
+
         const experiences = await getExperiences(view);
         renderExperiences(experiences);
-        
-        // Load projects for this view
+
         const projects = await getProjects(view);
         renderProjects(projects);
-        
-        // Load training (always show all)
+
         const training = await getTraining();
         renderTraining(training);
-        
     } catch (error) {
         console.error('Error loading view:', error);
-        document.getElementById('skillsContainer').innerHTML = 
-            '<div class="error">Error loading data. Check console for details.</div>';
     }
 }
 
-// ============================================
-// EVENT LISTENERS
-// ============================================
-
-/**
- * Set up view switching buttons
- */
 function setupViewButtons() {
     document.getElementById('publicView')?.addEventListener('click', () => loadView('public'));
+
     document.getElementById('employerView')?.addEventListener('click', () => {
-        // In production, you'd add password protection here
         const password = prompt('Enter employer access code:');
-        if (password === 'employer123') { // Change this!
+        if (password === 'employer123') {
             loadView('employer');
         } else {
             alert('Incorrect access code');
         }
     });
+
     document.getElementById('privateView')?.addEventListener('click', () => {
-        // In production, you'd add proper authentication here
         const password = prompt('Enter private access code:');
-        if (password === 'private123') { // Change this!
+        if (password === 'private123') {
             loadView('private');
         } else {
             alert('Incorrect access code');
@@ -405,34 +400,22 @@ function setupViewButtons() {
 }
 
 // ============================================
-// INITIALIZATION
+// INITIALISATION
 // ============================================
-
-/**
- * Initialize the app
- */
 async function init() {
     console.log('CareerID Skills Passport initializing...');
-    
-    // Set up view buttons
     setupViewButtons();
-    
-    // Load initial view (public)
     await loadView('public');
-    
-    console.log('CareerID Skills Passport loaded successfully!');
+    console.log('CareerID Skills Passport loaded.');
 }
 
-// Run when DOM is ready
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
 } else {
     init();
 }
 
-// ============================================
-// EXPORT FOR TESTING (optional)
-// ============================================
+// For testing
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         fetchAirtableData,
